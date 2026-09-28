@@ -1,270 +1,290 @@
 # Dispatchly
 
-A from-scratch rebuild of the uploaded "Email Job Scheduler" project: same
-core capability (schedule single or CSV/bulk emails, delivered on time
-through Ethereal test inboxes, rate-limited per account, durable across
-restarts, real Google sign-in), rebuilt with a different data model, a
-different backend module layout, a different rate-limiting/idempotency
-implementation, and a completely different UI.
+**Schedule email campaigns that go out on time, at a controlled pace, and survive restarts.**
+
+Dispatchly is a full-stack email scheduling app. You sign in with Google, write a message, add recipients (typed, pasted, or uploaded as a CSV), choose a start time, and Dispatchly delivers each email at the right moment. Delivery is spread across several sender accounts with per-account spacing and hourly limits, and nothing is lost if the server restarts.
 
 ---
 
-## 1. What changed, and why
+## Contents
 
-| Area | Original | Dispatchly | Why |
-|---|---|---|---|
-| Data model naming | `User` / `Sender` / `Batch` / `Email` | `User` / `MailAccount` / `Campaign` / `Message` | Clearer domain language; a "campaign" is the unit the user launches, a "message" is one delivery |
-| Status enum | lowercase (`scheduled`, `processing`, ...) | uppercase `MessageStatus` (`QUEUED`, `CLAIMED`, `DELIVERED`, `FAILED`) | Simpler 4-state lifecycle, explicit Prisma enum instead of string literals |
-| Backend framework choices | Passport-free Google OAuth, raw SQL claim | kept both ideas but re-implemented independently | These were good decisions worth keeping — re-derived, not copied |
-| Rate limiting | one Lua script (spacing + hourly) | own Lua script (`DeliveryThrottle`), different key layout, decrement-based release | Same two guarantees, independent implementation |
-| Recovery on restart | reconcile "processing" + orphaned "scheduled" rows | `recoveryService.ts`: `reconcileStaleClaims` + `requeueOrphans`, with a fix so a reclaimed stale row gets a fresh job immediately instead of silently stalling | Functionally equivalent, closes a gap found while re-deriving it |
-| Search | client-side filter only | real backend search (`?q=`) across recipient/subject/body, still paired with client-side polling | Matches the spirit of "add search" without pretending the UI does something the API doesn't |
-| Frontend framework | inbox-style single view, Gmail palette (`#00a843`), sidebar nav, `contentEditable` compose, full-page navigation | top navbar + tab pills, indigo/slate ("ink") palette, `Sora`/`Inter` type pairing, stat cards, right-side slide-over drawers for compose and detail, floating action button | Substantially different layout, navigation pattern, and visual language while keeping the same user flows |
-| Auth transport | JWT cookie + `?token=` redirect + localStorage bearer | same dual-transport idea (works across different frontend/backend origins), re-implemented with `google-auth-library` directly and a signed-state CSRF check | Kept the practical cross-origin-friendly design, rewritten end to end |
-| Attachments / rich text | `contentEditable` editor with base64-embedded images | plain textarea, CSV/TXT upload for recipients only | Simplified deliberately — rich HTML-in-body editing added risk and complexity out of proportion to the assignment's core ask; documented here rather than silently dropped |
-
-Nothing from the original's source was copied verbatim — every file here
-was written fresh, informed by understanding what the original did and why.
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [How it works](#how-it-works)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Environment variables](#environment-variables)
+- [API reference](#api-reference)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Design decisions](#design-decisions)
+- [Limitations](#limitations)
+- [Future improvements](#future-improvements)
 
 ---
 
-## 2. Project layout
+## Features
+
+**Scheduling**
+- Schedule one email or thousands in a single campaign
+- Recipients from pasted text or a CSV/TXT upload, with live valid and invalid counts
+- Choose the start time, the delay between sends, and an hourly limit per sender
+- Every email is its own delayed job, so there is no cron and no polling loop
+
+**Reliable delivery**
+- Several sender accounts share the load automatically (round-robin)
+- Minimum spacing between sends and an hourly cap, enforced per sender in Redis
+- When a limit is hit, the email is pushed to a later time. It is never dropped
+- An email is never sent twice, even if a job is redelivered or a worker crashes
+- Failed sends retry automatically with exponential backoff
+
+**Dashboard**
+- Google sign-in, with your name, email and avatar shown in the header
+- Upcoming and Delivered tabs, live status counts, and search across recipient, subject and body
+- Message detail panel with the failure reason and an Ethereal preview link
+- Loading, empty, error and success states throughout
+- Works on desktop and mobile
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS |
+| Backend | Node.js, Express, TypeScript |
+| Database | PostgreSQL with Prisma ORM |
+| Queue | BullMQ on Redis |
+| Email | Nodemailer with Ethereal SMTP (test inboxes) |
+| Auth | Google OAuth 2.0 (`google-auth-library`) and signed JWT sessions |
+| Validation | Zod |
+| Tests | Vitest |
+
+---
+
+## How it works
+
+```
+ Browser (React)
+      |  REST + JWT
+      v
+ Express API ------> PostgreSQL   (users, campaigns, messages, sender accounts)
+      |
+      |  one delayed job per message
+      v
+ Redis / BullMQ  <-----> Worker  ------> Ethereal SMTP
+      ^                     |
+      |                     +--> Redis throttle (spacing + hourly cap)
+      +---- startup recovery reads Postgres and re-queues anything unfinished
+```
+
+### Scheduling
+Launching a campaign creates one `Campaign` and one `Message` row per recipient in a single database transaction. Each message gets a scheduled time (`startAt + index x delay`) and a sender account chosen round-robin. Then one BullMQ delayed job is added per message, in chunks of 1000. BullMQ keeps delayed jobs in Redis, so timing is handled by the queue itself.
+
+### Throttling
+Just before sending, the worker asks a small Lua script in Redis whether that sender may send right now. The script checks and reserves two limits in one atomic step:
+
+1. **Spacing:** a short-lived key that blocks the sender until the minimum gap has passed.
+2. **Hourly cap:** a counter for the current UTC hour.
+
+If either limit blocks the send, the script returns how long to wait. The worker then moves the same job to that later time. Because the check and the reservation happen together, many workers can run in parallel without exceeding a limit.
+
+### Idempotency
+Two safeguards prevent duplicate sends:
+
+- The job ID is the message ID, so adding the same job twice has no effect.
+- Before sending, the worker atomically flips the row from `QUEUED` to `CLAIMED`. If the update changes nothing, another worker already has it and this one stops.
+
+Messages that are already delivered or failed are skipped outright.
+
+### Surviving restarts
+Redis (with append-only persistence) keeps the delayed jobs, and Postgres keeps the message state. On startup, a recovery pass also handles the edge cases:
+
+- A message stuck in `CLAIMED` past the timeout means a worker died mid-send. If the provider had accepted it, it is marked delivered. Otherwise it goes back in the queue.
+- A message that was saved but never queued, because the API was killed in between, is queued now.
+
+---
+
+## Project structure
 
 ```
 dispatchly/
-├── docker-compose.yml          # Postgres + Redis
+├── docker-compose.yml            Postgres and Redis for local development
 ├── backend/
-│   ├── prisma/
-│   │   ├── schema.prisma        # User, MailAccount, Campaign, Message
-│   │   ├── migrations/000_init/migration.sql
-│   │   └── seed.ts               # provisions an Ethereal mail-account pool
+│   ├── prisma/                   schema, SQL migration, seed script
 │   ├── src/
-│   │   ├── config/env.ts         # zod-validated environment config
-│   │   ├── lib/                  # prisma.ts, redis.ts, logger.ts
-│   │   ├── repositories/         # mailAccountRepository, messageRepository
-│   │   ├── services/             # campaignService, deliveryThrottle, mailer,
-│   │   │                        # googleAuthService, recoveryService
-│   │   ├── queue/                # deliveryQueue, deliveryProcessor, workerFactory
-│   │   ├── controllers/, routes/, middleware/, validators/, types/
-│   │   ├── app.ts                 # Express app assembly
-│   │   ├── server.ts              # API + inline worker (single-service deploy)
-│   │   └── worker.ts              # standalone worker process
-│   └── tests/                     # throttle, scheduling, validators, recovery, launch
+│   │   ├── config/               validated environment config
+│   │   ├── controllers/  routes/  middleware/  validators/
+│   │   ├── repositories/         database access
+│   │   ├── services/             campaign logic, throttle, mailer, Google auth, recovery
+│   │   ├── queue/                queue, job processor, worker factory
+│   │   ├── app.ts                Express app
+│   │   ├── server.ts             API plus inline worker
+│   │   └── worker.ts             standalone worker
+│   └── tests/
 └── frontend/
     └── src/
-        ├── lib/ (api.ts, csv.ts, dates.ts), hooks/ (useAuth, useMessageFeed)
-        ├── components/ (TopNav, MessageList, StatCard, StatusPill, drawers, compose/*)
-        └── pages/ (LoginPage, DashboardPage)
+        ├── components/           top nav, message list, stat cards, drawers, compose form
+        ├── pages/                login and dashboard
+        ├── hooks/                auth and message feed
+        └── lib/                  API client, CSV parsing, date helpers
 ```
 
 ---
 
-## 3. Prerequisites
+## Getting started
 
-- Node.js 20+
-- Docker + Docker Compose
-- A Google Cloud OAuth 2.0 Client ID
+### Prerequisites
+- Node.js 20 or newer
+- Docker and Docker Compose
+- A Google Cloud OAuth client (see step 4)
 
----
-
-## 4. Setup & running
-
-### 4.1 Infrastructure
-
+### 1. Start Postgres and Redis
 ```bash
 docker compose up -d
 ```
 
-### 4.2 Backend
-
+### 2. Set up the backend
 ```bash
 cd backend
-cp .env.example .env         # fill in GOOGLE_CLIENT_ID/SECRET
+cp .env.example .env        # then fill in the Google credentials
 npm install
-npm run db:migrate           # applies prisma/migrations/000_init
-npm run db:generate
-npm run seed:accounts        # provisions Ethereal mail accounts (MAIL_ACCOUNT_POOL_SIZE)
-npm run dev                  # API + inline worker on :5000
+npm run db:migrate          # create the tables
+npm run db:generate         # generate the Prisma client
+npm run seed:accounts       # create the Ethereal sender accounts
+npm run dev                 # API and worker on http://localhost:5000
 ```
 
-To scale delivery separately from the API, set `ENABLE_INLINE_WORKER=false`
-in `.env` and run the worker as its own process:
-
-```bash
-npm run dev:worker
-```
-
-Production: `npm run build && npm start` (+ `npm run start:worker` if split out).
-
-### 4.3 Frontend
-
+### 3. Set up the frontend
 ```bash
 cd frontend
-cp .env.example .env         # VITE_API_URL=http://localhost:5000
+cp .env.example .env
 npm install
-npm run dev                  # http://localhost:5173
+npm run dev                 # http://localhost:5173
 ```
 
-### 4.4 Google OAuth setup
+### 4. Google OAuth
+1. In the [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **OAuth client ID** of type *Web application*.
+2. Add `http://localhost:5173` as an authorized JavaScript origin.
+3. Add `http://localhost:5000/api/auth/google/callback` as an authorized redirect URI.
+4. Copy the client ID and secret into `backend/.env`.
 
-1. Create an OAuth 2.0 Client ID (Web application) in the
-   [Google Cloud Console](https://console.cloud.google.com/apis/credentials).
-2. Authorized redirect URI: `http://localhost:5000/api/auth/google/callback`.
-3. Authorized JavaScript origin: `http://localhost:5173`.
-4. Put the client ID/secret in `backend/.env`.
-
-Flow: `GET /api/auth/google` → Google consent → `GET
-/api/auth/google/callback` (state is a signed JWT checked against a
-short-lived cookie for CSRF protection) → upserts the `User` row keyed on
-Google's `sub` → issues a JWT → sets it as an httpOnly cookie **and** appends
-it as `?session=` on the redirect back to the frontend, which stores it in
-`localStorage` and sends it as a `Bearer` token thereafter. This dual
-transport means the app keeps working even when frontend and backend are on
-different origins in production (e.g. Vercel + Render), where third-party
-cookies are unreliable.
+### Running the worker separately
+To scale delivery independently of the API, set `ENABLE_INLINE_WORKER=false` in `backend/.env`, then run these in two terminals:
+```bash
+npm run dev          # API only
+npm run dev:worker   # worker only
+```
 
 ---
 
-## 5. Environment variables
+## Environment variables
 
-See `backend/.env.example` / `frontend/.env.example` for the full list.
-Notable ones: `MIN_SPACING_MS` / campaign `spacingMs` (minimum gap between
-two sends from the same mail account), `MAX_HOURLY_CAP` / campaign
-`hourlyCap` (per-account hourly send ceiling), `WORKER_CONCURRENCY`,
-`STALE_CLAIM_MS` (how long a `CLAIMED` message can sit before recovery
-treats the claiming worker as dead), `MAX_RECIPIENTS_PER_CAMPAIGN`.
+### Backend (`backend/.env`)
 
----
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `5000` | API port |
+| `NODE_ENV` | `development` | Set to `production` when deployed |
+| `FRONTEND_URL` | `http://localhost:5173` | Allowed origin for CORS and the sign-in redirect |
+| `DATABASE_URL` | required | PostgreSQL connection string |
+| `REDIS_URL` | required | Redis connection string |
+| `JWT_SECRET` | required | At least 16 characters. Signs sessions |
+| `GOOGLE_CLIENT_ID` | | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | | Google OAuth client secret |
+| `GOOGLE_CALLBACK_URL` | `http://localhost:5000/api/auth/google/callback` | Must match the Google console exactly |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` | Ethereal defaults | SMTP fallback settings |
+| `MAIL_ACCOUNT_POOL_SIZE` | `4` | Number of sender accounts the seed script creates |
+| `ENABLE_INLINE_WORKER` | `true` | Set to `false` to run the worker as its own process |
+| `WORKER_CONCURRENCY` | `5` | Jobs processed in parallel |
+| `MIN_SPACING_MS` | `2000` | Smallest allowed delay between sends |
+| `MAX_HOURLY_CAP` | `200` | Largest allowed hourly limit per sender |
+| `MAX_RECIPIENTS_PER_CAMPAIGN` | `10000` | Upper bound on campaign size |
+| `STALE_CLAIM_MS` | `300000` | How long a claimed message can sit before recovery steps in |
 
-## 6. How scheduling works (BullMQ, not cron)
+### Frontend (`frontend/.env`)
 
-`launchCampaign` creates one `Campaign` row and, in a single Prisma
-transaction, one `Message` row per recipient, with `scheduledFor` staggered
-by `spacingMs` and `mailAccountId` assigned round-robin across the active
-`MailAccount` pool (this pool, not a picker in the compose form, is what
-"multiple senders" means here — a campaign automatically spreads load across
-every account you've provisioned). Each message then gets exactly one BullMQ
-delayed job, `jobId = message.id`, added via `deliveryQueue.addBulk` in
-1000-row chunks. **No cron, no node-cron, no Agenda, no polling loop** —
-BullMQ's Redis-backed delayed-job timer is the only thing deciding when a
-job becomes runnable.
-
-## 7. Idempotency
-
-Two layers, matching the ones the original used, independently written:
-
-1. **BullMQ job identity.** `jobId = message.id`, so re-adding a job for a
-   message that already has one queued is a safe no-op at the queue layer.
-2. **Atomic conditional claim.** The worker only proceeds to send after
-   `UPDATE messages SET status='CLAIMED' ... WHERE status='QUEUED' OR
-   (status='CLAIMED' AND claimedAt < staleBefore)` reports it changed a row.
-   If two workers ever raced on a redelivered job, only one wins the update
-   and the other returns immediately. Already-`DELIVERED`/`FAILED` messages
-   are also skipped outright before any of this runs.
-
-## 8. Restart persistence
-
-- **Redis** (Docker volume, AOF enabled) persists BullMQ's delayed-job
-  timers, so a plain process restart needs no special handling.
-- **Postgres** persists the `Message` row, independent of Redis.
-- On boot (`server.ts` and `worker.ts` both call this), `runStartupRecovery`
-  handles the harder cases: `reconcileStaleClaims` finds messages stuck in
-  `CLAIMED` past `STALE_CLAIM_MS` (a worker died mid-send) — if Ethereal had
-  already accepted the send it's marked `DELIVERED`, otherwise it's put back
-  to `QUEUED` **and immediately re-enqueued** (not just flipped in the
-  database and left to hope something else picks it up). `requeueOrphans`
-  separately catches messages whose row was written but whose BullMQ job was
-  never placed at all (crash between the Postgres write and `addBulk`).
-
-## 9. Rate limiting (per mail account, spacing + hourly cap, never dropped)
-
-`DeliveryThrottle.reserveSlot` runs one Lua script per attempt that checks
-*and* reserves both constraints atomically: a short-lived "spacing" key
-(`PTTL` gate) enforcing the minimum gap since the account's last send, and an
-hourly counter keyed by UTC clock-hour enforcing the campaign's `hourlyCap`.
-If either is unavailable, the script returns how many milliseconds to wait;
-the worker calls `job.moveToDelayed(...)` **on the same job** and throws
-`DelayedError`, so the message is pushed later without ever creating a
-second job or losing its place — never dropped, only deferred.
-
-*Trade-off:* fixed UTC-hour buckets (vs. a sliding window) allow a small
-burst right at the hour boundary in exchange for a much simpler, cheaper
-Redis footprint — the same trade-off the original made, kept deliberately.
-
-## 10. Handling large campaigns (1000+)
-
-Message rows are chunked into `createMany` calls of 1000 during the single
-creation transaction, and BullMQ jobs are chunked into `addBulk` calls of
-1000 right after. Nothing about creating 2500 messages blocks longer than
-that; nothing about *sending* them serializes beyond what `spacingMs`/
-`hourlyCap` intentionally enforce, since every message is its own
-independently-timed job picked up by the worker pool
-(`WORKER_CONCURRENCY`). Covered in `tests/messageScheduling.test.ts` and
-`tests/campaignLaunch.test.ts`.
-
-## 11. Search
-
-`GET /api/campaigns/upcoming?q=...` and `.../delivered?q=...` do a
-case-insensitive match across `recipient`, `subject`, and `body`, combined
-with pagination. The dashboard's search box drives both tabs through the
-same `useMessageFeed` hook.
+| Variable | Description |
+|---|---|
+| `VITE_API_URL` | Base URL of the API, for example `http://localhost:5000` |
 
 ---
 
-## 12. Testing
+## API reference
+
+All `/api/campaigns` routes require a signed-in user (session cookie or `Authorization: Bearer <token>`).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Service health check |
+| `GET` | `/api/auth/google` | Start Google sign-in |
+| `GET` | `/api/auth/google/callback` | Google redirect target |
+| `GET` | `/api/auth/session` | Current user |
+| `POST` | `/api/auth/logout` | Sign out |
+| `POST` | `/api/campaigns` | Launch a campaign |
+| `GET` | `/api/campaigns/stats` | Message counts by status |
+| `GET` | `/api/campaigns/upcoming` | Queued and sending messages |
+| `GET` | `/api/campaigns/delivered` | Delivered and failed messages |
+| `GET` | `/api/campaigns/:id` | One message |
+
+The list endpoints accept `limit`, `offset` and `q` (search).
+
+**Launch a campaign**
+```http
+POST /api/campaigns
+Content-Type: application/json
+
+{
+  "subject": "Hello",
+  "body": "Message text",
+  "recipients": ["a@example.com", "b@example.com"],
+  "startAt": "2026-10-01T09:00:00.000Z",
+  "spacingMs": 2000,
+  "hourlyCap": 100
+}
+```
+
+Errors return `{ "error": { "message": "...", "details": [...] } }` with a suitable status code.
+
+---
+
+## Testing
 
 ```bash
 cd backend
 npm test
 ```
 
-- `tests/deliveryThrottle.test.ts` — spacing gate, hourly cap, independent
-  accounts, slot release, all against the real Lua script via `ioredis-mock`.
-- `tests/messageScheduling.test.ts` — `spacingMs` staggering, round-robin
-  account assignment, a 1500-recipient batch with none dropped.
-- `tests/campaignLaunch.test.ts` — chunked `addBulk` calls for 2500
-  messages, and the "no mail accounts provisioned" error path.
-- `tests/validators.test.ts` — zod schema edge cases (past `startAt`,
-  malformed recipients, over-limit `hourlyCap`, dedupe + lower-casing).
-- `tests/recoveryService.test.ts` — stale-claim reconciliation (both the
-  "already delivered" and "needs re-queue" branches) and orphan requeueing.
+The suite covers:
+- **Throttle:** spacing, hourly cap, separate senders, releasing a slot
+- **Scheduling:** staggered times, round-robin sender assignment, campaigns of 1500 or more
+- **Campaign launch:** chunked queueing for 2500 messages, and the case where no sender accounts exist
+- **Validation:** past start times, invalid addresses, limits, de-duplication
+- **Recovery:** stale claims and unqueued messages after a crash
 
-Prisma, the queue, and mail account lookups are mocked so these run fast and
-deterministically without live Postgres/Redis; the throttle test is the
-exception, exercising the real Lua script against `ioredis-mock`.
+Database and queue calls are mocked so the tests run without infrastructure. The throttle tests run the real Lua script against `ioredis-mock`.
 
 ---
 
-## 13. API summary
+## Deployment
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/auth/google` | Start Google OAuth |
-| `GET` | `/api/auth/google/callback` | OAuth callback |
-| `GET` | `/api/auth/session` | Current user |
-| `POST` | `/api/auth/logout` | Clear session |
-| `GET` | `/api/campaigns/stats` | Counts by status |
-| `GET` | `/api/campaigns/upcoming?q=&limit=&offset=` | Queued + claimed messages |
-| `GET` | `/api/campaigns/delivered?q=&limit=&offset=` | Delivered + failed messages |
-| `GET` | `/api/campaigns/:id` | One message |
-| `POST` | `/api/campaigns` | Launch a campaign |
+A typical free-tier setup:
 
----
+| Part | Service |
+|---|---|
+| Frontend | Vercel (root directory `frontend`, env `VITE_API_URL`) |
+| API and worker | Render web service (root directory `backend`) |
+| PostgreSQL | Neon (use the direct connection string) |
+| Redis | Render Key Value, with eviction set to `noeviction` |
 
-## 14. Sandbox note & other trade-offs
+**Render settings**
+- Build command: `npm install --include=dev && npm run build`
+- Start command: `npx prisma migrate deploy && node dist/server.js`
+- Set `NODE_ENV=production` and all the backend variables above.
 
-This was built in an offline sandbox with no network access, so
-`npm install`, `docker compose up`, and a live Google OAuth handshake could
-not be executed here — every file is complete, real code (nothing is a
-stub or placeholder), reviewed by hand for consistency, but you should run
-`npm install` and the commands above yourself to do a first real build.
+**After deploying**
+1. Run `npm run seed:accounts` once against the production database to create sender accounts.
+2. Set `FRONTEND_URL` on Render to the exact Vercel URL, with no trailing slash.
+3. Add the Vercel URL and the API callback URL to the Google OAuth client.
+4. Use a free uptime monitor on `/health`. Free Render instances sleep when idle, and scheduled emails only send while the service is awake.
 
-- **Ethereal only** — nothing is ever really delivered, matching the
-  original and the assignment's intent.
-- **Mail account credentials in plain columns** — fine for this scope; a
-  production system would encrypt them at rest.
-- **No rich-text/attachment editor** — simplified to a plain textarea and a
-  recipients-only CSV upload, as noted in §1.
-- **Sequential campaign creation** inside one transaction (not parallel
-  writes) keeps DB load predictable for very large recipient lists, at the
-  cost of a longer `POST /api/campaigns` response time for huge batches.
