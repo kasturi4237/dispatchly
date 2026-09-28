@@ -17,9 +17,6 @@ Dispatchly is a full-stack email scheduling app. You sign in with Google, write 
 - [API reference](#api-reference)
 - [Testing](#testing)
 - [Deployment](#deployment)
-- [Design decisions](#design-decisions)
-- [Limitations](#limitations)
-- [Future improvements](#future-improvements)
 
 ---
 
