@@ -1,0 +1,101 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Lifecycle of one outgoing message. Deliberately small and linear:
+// QUEUED -> CLAIMED -> DELIVERED, with FAILED as the terminal error state.
+enum MessageStatus {
+  QUEUED
+  CLAIMED
+  DELIVERED
+  FAILED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  googleSub String   @unique
+  name      String
+  email     String   @unique
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[]
+  messages  Message[]
+
+  @@map("users")
+}
+
+// A mail-sending identity backed by an Ethereal test inbox. Campaigns fan
+// their messages out across every active account (round-robin), which is
+// what "multiple senders" means in this app - the sender is a shared
+// resource pool, not something the composer picks by hand.
+model MailAccount {
+  id           String   @id @default(uuid())
+  address      String
+  smtpUser     String
+  smtpPass     String
+  smtpHost     String   @default("smtp.ethereal.email")
+  smtpPort     Int      @default(587)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  messages Message[]
+
+  @@map("mail_accounts")
+}
+
+// One "send this to N recipients" request becomes one Campaign + N Messages.
+model Campaign {
+  id          String   @id @default(uuid())
+  userId      String
+  spacingMs   Int // enforced minimum gap between two sends on the same account
+  hourlyCap   Int // enforced max sends per account per rolling clock-hour
+  startAt     DateTime
+  createdAt   DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId])
+  @@map("campaigns")
+}
+
+model Message {
+  id            String        @id @default(uuid())
+  userId        String
+  campaignId    String
+  mailAccountId String
+  recipient     String
+  subject       String
+  body          String        @db.Text
+
+  scheduledFor  DateTime // when this message is meant to go out
+  deliveredAt   DateTime?
+
+  status          MessageStatus @default(QUEUED)
+  attemptCount    Int           @default(0)
+  failureReason   String?
+  providerMessageId String?
+  previewUrl      String?
+
+  queuedAt    DateTime? // when a BullMQ job was actually placed for this row
+  claimedAt   DateTime? // when a worker atomically claimed it for sending
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaign    Campaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  mailAccount MailAccount @relation(fields: [mailAccountId], references: [id])
+
+  @@index([userId, status, scheduledFor])
+  @@index([userId, status, deliveredAt])
+  @@index([campaignId])
+  @@map("messages")
+}
